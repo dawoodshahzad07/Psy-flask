@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+openai
+PyPDF2
+python-docx
+tiktoken
