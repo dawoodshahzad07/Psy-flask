@@ -1,14 +1,23 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 import PyPDF2
 import docx
-import tiktoken  # For token counting
+import tiktoken
 from io import BytesIO
-import os
 import json
 
 app = FastAPI()
+
+# Add CORS middleware to allow requests from all origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Set up the OpenAI client
 client = OpenAI(
@@ -21,7 +30,7 @@ psychotherapy_keywords = ["therapy", "therapist", "session", "client", "counseli
 
 # Function to count tokens (requires tiktoken library)
 def count_tokens(text):
-    encoding = tiktoken.get_encoding("cl100k_base")  # Choose appropriate encoding
+    encoding = tiktoken.get_encoding("cl100k_base")
     tokens = encoding.encode(text)
     return len(tokens)
 
@@ -39,60 +48,54 @@ def truncate_text(prompt, text, max_tokens):
     return text
 
 # Function to handle streaming response from Upstage's solar-pro model
-# Function to handle streaming response from Upstage's solar-pro model
 def get_streamed_response(text):
-    # Token limit for the model
     max_tokens = 3000
 
-    # Define the prompt with JSON format instructions
     prompt = f"""
     Generate a detailed SOAP note and summaries based on the following psychotherapy transcript. 
-    The response should be in JSON format with the following keys: "Subjective", "Objective", "Assessment", "Plan", "ClinicianSummary", "Client Summary".
+    The response should be in JSON format with the following keys: "subjective", "objective", "assessment", "plan", "clinicianSummary", "clientSummary".
 
-    Please format the response exactly as follows:
+    Please format the response exactly as follows, without any additional formatting or escaping:
 
     {{
-        "Subjective": "<Subjective content>",
-        "Objective": "<Objective content>",
-        "Assessment": "<Assessment content>",
-        "Plan": "<Plan content>",
-        "Clinician Summary": "<Clinician summary content>",
-        "Client Summary": "<Client summary content>"
+        "subjective": "<Subjective content>",
+        "objective": "<Objective content>",
+        "assessment": "<Assessment content>",
+        "plan": "<Plan content>",
+        "clinicianSummary": "<Clinician summary content>",
+        "clientSummary": "<Client summary content>"
     }}
 
     Transcript:
     {text}
     """
     
-    # Truncate the text to fit within the token limit, including the prompt
     truncated_text = truncate_text(prompt, text, max_tokens)
 
-    # Modify the prompt to specifically request SOAP note format and summaries
     final_prompt = f"""
     Generate a detailed SOAP note and summaries based on the following psychotherapy transcript. 
-    The response should be in JSON format with the following keys: "Subjective", "Objective", "Assessment", "Plan", "Clinician Summary", "Client Summary".
+    The response should be in JSON format with the following keys: "subjective", "objective", "assessment", "plan", "clinicianSummary", "clientSummary".
 
-    Please format the response exactly as follows:
+    Please format the response exactly as follows, without any additional formatting or escaping:
 
     {{
-        "Subjective": "<Subjective content>",
-        "Objective": "<Objective content>",
-        "Assessment": "<Assessment content>",
-        "Plan": "<Plan content>",
-        "Clinician Summary": "<Clinician summary content>",
-        "Client Summary": "<Client summary content>"
+        "subjective": "<Subjective content>",
+        "objective": "<Objective content>",
+        "assessment": "<Assessment content>",
+        "plan": "<Plan content>",
+        "clinicianSummary": "<Clinician summary content>",
+        "clientSummary": "<Client summary content>"
     }}
 
     Transcript:
     {truncated_text}
     """
     
-    # Stream the API response as the output generates
     stream = client.chat.completions.create(
         model="solar-pro",
         messages=[{
             "role": "system",
-            "content": "You are a helpful assistant. Please provide responses in JSON format as described."
+            "content": "You are a helpful assistant. Please provide responses in JSON format as described, without any additional formatting or escaping."
         }, {
             "role": "user",
             "content": final_prompt
@@ -100,21 +103,49 @@ def get_streamed_response(text):
         stream=True,
     )
 
-    # Yield chunks of streamed content
     full_response = ""
     for chunk in stream:
         if chunk.choices[0].delta.content is not None:
             full_response += chunk.choices[0].delta.content
     
-    # Attempt to parse the response as JSON
+    def clean_and_truncate(text, max_length=1000):
+        # Remove newlines and extra spaces
+        cleaned = ' '.join(text.split())
+        # Truncate if necessary
+        return (cleaned[:max_length] + '...') if len(cleaned) > max_length else cleaned
+
     try:
+        # First, try to parse the entire response as JSON
         parsed_response = json.loads(full_response)
     except json.JSONDecodeError:
-        # If parsing fails, treat it as plain text
-        return {"error": "Failed to parse response as JSON", "response": full_response}
+        # If that fails, try to extract a JSON object from the response
+        try:
+            start = full_response.find('{')
+            end = full_response.rfind('}') + 1
+            if start != -1 and end != -1:
+                parsed_response = json.loads(full_response[start:end])
+            else:
+                raise json.JSONDecodeError("No valid JSON found", full_response, 0)
+        except json.JSONDecodeError:
+            # If JSON extraction fails, create a structured response with cleaned content
+            return {
+                "subjective": clean_and_truncate(full_response),
+                "objective": "Error: Could not parse response",
+                "assessment": "Error: Could not parse response",
+                "plan": "Error: Could not parse response",
+                "clinicianSummary": "Error: Could not parse response",
+                "clientSummary": "Error: Could not parse response"
+            }
+
+    # Ensure all required keys are present and clean/truncate the content
+    required_keys = ["subjective", "objective", "assessment", "plan", "clinicianSummary", "clientSummary"]
+    for key in required_keys:
+        if key not in parsed_response or not isinstance(parsed_response[key], str):
+            parsed_response[key] = "Not provided"
+        else:
+            parsed_response[key] = clean_and_truncate(parsed_response[key])
 
     return parsed_response
-
 
 # Helper function to extract text from file-like objects (PDF, DOCX, or TXT)
 def extract_text_from_file(file: BytesIO, file_type: str):
@@ -141,24 +172,19 @@ def is_relevant_psychotherapy_text(text):
 @app.post("/generate-soap/")
 async def generate_soap(file: UploadFile = File(...)):
     try:
-        # Extract text from the uploaded file
         file_content = await file.read()
         transcript_text = extract_text_from_file(BytesIO(file_content), file.content_type)
 
         if not transcript_text:
             raise HTTPException(status_code=400, detail="No text extracted from the file")
 
-        # Check if the transcript is related to psychotherapy
         if not is_relevant_psychotherapy_text(transcript_text):
             raise HTTPException(status_code=400, detail="The transcript does not appear to be related to psychotherapy")
 
-        # Generate SOAP notes using the extracted text
         soap_notes = get_streamed_response(transcript_text)
 
-        # Return response based on its format
-        if "error" in soap_notes:
-            return PlainTextResponse(content=soap_notes["response"], status_code=200)
-        return JSONResponse(content={"soap_notes": soap_notes})
+        # Return the SOAP notes directly, without the "soapNotes" wrapper
+        return JSONResponse(content=soap_notes)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate SOAP notes: {str(e)}")
