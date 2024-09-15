@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-openai
+google-generativeai
 PyPDF2
 python-docx
 tiktoken
